@@ -1,5 +1,5 @@
 //! Typed queues retain accepted batches until their writer acknowledges success.
-//! Database transactions, idempotency and diagnostics belong to writer adapters.
+//! The PostgreSQL writer owns deadlines, atomic receipts and failure diagnostics.
 //! Storage is volatile: process termination and adapter panics are not recoverable.
 
 mod admission;
@@ -7,6 +7,7 @@ mod admission;
 pub mod postgres;
 mod queue;
 mod telemetry;
+mod timeouts;
 mod worker;
 
 pub use admission::{Admission, EnqueueGuard};
@@ -16,4 +17,5 @@ pub use queue::{
     BatchIdentity, BatchInfo, BatchQueue, BatchWriter, FlushOutcome, Observer, Queued,
 };
 pub use telemetry::QueueTelemetry;
+pub use timeouts::{TimeoutConfigError, WriteTimeouts};
 pub use worker::{FlushCycle, Worker, WorkerCadence, WorkerEvent};

@@ -10,6 +10,9 @@ use sqlx::{Encode, Postgres, Type};
 
 use crate::QueueTelemetry;
 
+mod writer;
+pub use writer::{write_error, DatabaseWriter, PreparedBatch, TransactionBatch, WriteFailure};
+
 tokio::task_local! {
     static ACTIVE_TELEMETRY: Option<QueueTelemetry>;
 }

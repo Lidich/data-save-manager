@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 
-use data_save_manager::postgres::MeasuredJson;
+use data_save_manager::postgres::{write_error, MeasuredJson};
 use data_save_manager::{BatchQueue, BatchWriter, FlushOutcome, QueueTelemetry, Queued};
 use opentelemetry::metrics::{Meter, MeterProvider};
 use opentelemetry::KeyValue;
@@ -19,6 +19,25 @@ use sqlx::postgres::{PgArgumentBuffer, PgTypeInfo};
 use sqlx::types::Json;
 use sqlx::{Encode, Postgres, Type};
 use tokio::sync::{mpsc::unbounded_channel, Barrier};
+
+#[test]
+fn report_write_errors_preserve_the_root_sqlx_type_and_context() {
+    for nested in [false, true] {
+        let source = anyhow::Error::new(sqlx::Error::Protocol("typed root".into()));
+        let source = if nested {
+            source.context("adapter context")
+        } else {
+            source
+        };
+        let error = write_error(source);
+        assert!(error
+            .chain()
+            .any(|cause| cause.downcast_ref::<sqlx::Error>().is_some()));
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("typed root"));
+        assert_eq!(rendered.contains("adapter context"), nested);
+    }
+}
 
 struct Metrics {
     provider: SdkMeterProvider,

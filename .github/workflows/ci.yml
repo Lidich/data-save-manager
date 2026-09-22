@@ -5,6 +5,20 @@ on: [push, pull_request]
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: dsm_test
+          POSTGRES_PASSWORD: test_password
+          POSTGRES_DB: dsm_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U dsm_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -13,4 +27,7 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo test --locked
       - run: cargo test --locked --all-features
+      - run: cargo test --locked --all-features --test postgres_writer -- --ignored
+        env:
+          DSM_TEST_DATABASE_URL: postgres://dsm_test:test_password@127.0.0.1:5432/dsm_test
       - run: cargo clippy --locked --all-features --all-targets -- -D warnings
