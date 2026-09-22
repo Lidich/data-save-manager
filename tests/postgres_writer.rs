@@ -614,11 +614,7 @@ async fn slow_synchronous_prepare_exceeding_deadline_never_submits_sql() -> Resu
     let fixture = Fixture::new(true).await?;
     let proxy = ResponseProxy::start(&fixture.pool.connect_options()).await?;
     let proxy_pool = proxy.pool(&fixture.pool.connect_options());
-    let limits = WriteTimeouts::new(
-        Duration::from_millis(300),
-        Duration::from_millis(200),
-        Duration::from_millis(100),
-    )?;
+    let limits = timeouts();
     let writer = DatabaseWriter::new(proxy_pool.clone(), limits);
     writer.check_ready().await?;
     let submitted_before = proxy.submitted_queries.load(Ordering::SeqCst);
@@ -626,13 +622,17 @@ async fn slow_synchronous_prepare_exceeding_deadline_never_submits_sql() -> Resu
     let error = timeout(
         WATCHDOG,
         writer.write_prepared(id, QUEUE, || {
-            std::thread::sleep(Duration::from_millis(500));
+            std::thread::sleep(limits.batch() + Duration::from_millis(200));
             Ok(prepared(json!([{ "value": 1 }])))
         }),
     )
     .await?
     .unwrap_err();
     failure(&error, id, "client_deadline", None);
+    assert_eq!(
+        error.downcast_ref::<WriteFailure>().unwrap().stage,
+        "prepare"
+    );
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
         proxy.submitted_queries.load(Ordering::SeqCst),
