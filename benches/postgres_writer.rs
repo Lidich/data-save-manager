@@ -1,3 +1,5 @@
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{ensure, Result};
@@ -11,6 +13,32 @@ use uuid::Uuid;
 const SQL: &str = "INSERT INTO samples SELECT * FROM jsonb_populate_recordset(NULL::samples, (SELECT payload FROM data_save_input))";
 const BATCHES: usize = 40;
 const ROWS: usize = 500;
+
+struct CountingAllocator;
+
+static ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+static ALLOCATED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+#[global_allocator]
+static ALLOCATOR: CountingAllocator = CountingAllocator;
+
+unsafe impl GlobalAlloc for CountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        ALLOCATED_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+        ALLOCATED_BYTES.fetch_add(size, Ordering::Relaxed);
+        unsafe { System.realloc(ptr, layout, size) }
+    }
+}
 
 struct MultiStatement<'a>(&'a Value);
 
@@ -55,11 +83,15 @@ async fn benchmark() -> Result<()> {
             .collect(),
     );
     let mut samples: [Vec<Duration>; 3] = Default::default();
+    let mut allocations: [Vec<usize>; 3] = Default::default();
+    let mut allocated_bytes: [Vec<usize>; 3] = Default::default();
     for round in 0..8 {
         for variant in [round % 3, (round + 1) % 3, (round + 2) % 3] {
             sqlx::raw_sql("TRUNCATE samples, data_save_batches")
                 .execute(&pool)
                 .await?;
+            ALLOCATIONS.store(0, Ordering::Relaxed);
+            ALLOCATED_BYTES.store(0, Ordering::Relaxed);
             let started = Instant::now();
             for _ in 0..BATCHES {
                 let id = Uuid::new_v4();
@@ -91,6 +123,8 @@ async fn benchmark() -> Result<()> {
                 ensure!(affected == ROWS as u64, "incorrect acknowledgement");
             }
             let elapsed = started.elapsed();
+            let calls = ALLOCATIONS.load(Ordering::Relaxed);
+            let bytes = ALLOCATED_BYTES.load(Ordering::Relaxed);
             let count: i64 = sqlx::query_scalar("SELECT count(*) FROM samples")
                 .fetch_one(&pool)
                 .await?;
@@ -100,23 +134,30 @@ async fn benchmark() -> Result<()> {
             );
             if round != 0 {
                 samples[variant].push(elapsed);
+                allocations[variant].push(calls);
+                allocated_bytes[variant].push(bytes);
             }
         }
     }
-    for (name, measurements) in [
+    for (index, (name, measurements)) in [
         "existing receipt SQL",
         "shared prepared writer",
         "shared multi-statement writer",
     ]
     .iter()
     .zip(samples.iter_mut())
+    .enumerate()
     {
         measurements.sort();
         let median = measurements[measurements.len() / 2];
+        allocations[index].sort();
+        allocated_bytes[index].sort();
         println!(
-            "{name}: median_ms/batch={:.3} rows/s={:.0}",
+            "{name}: median_ms/batch={:.3} rows/s={:.0} allocs/batch={:.1} allocated_bytes/batch={:.0}",
             median.as_secs_f64() * 1000.0 / BATCHES as f64,
-            (BATCHES * ROWS) as f64 / median.as_secs_f64()
+            (BATCHES * ROWS) as f64 / median.as_secs_f64(),
+            allocations[index][allocations[index].len() / 2] as f64 / BATCHES as f64,
+            allocated_bytes[index][allocated_bytes[index].len() / 2] as f64 / BATCHES as f64
         );
     }
     drop(writer);

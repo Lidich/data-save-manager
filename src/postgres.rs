@@ -10,7 +10,9 @@ use sqlx::{Encode, Postgres, Type};
 
 use crate::QueueTelemetry;
 
+mod nul_recovery;
 mod writer;
+pub use nul_recovery::JsonNulRepair;
 pub use writer::{write_error, DatabaseWriter, PreparedBatch, TransactionBatch, WriteFailure};
 
 tokio::task_local! {

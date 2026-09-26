@@ -11,6 +11,7 @@ use sqlx::{Connection, PgConnection, PgPool, Row};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use super::nul_recovery::{remove_nuls, JsonNulRepair};
 use super::MeasuredJson;
 use crate::WriteTimeouts;
 
@@ -183,6 +184,7 @@ impl DatabaseWriter {
         Ok(connection)
     }
 
+    /// Automatically retries SQLSTATE 22P05 once after removing NUL from values and escaping JSON keys.
     pub async fn write_prepared<P>(
         &self,
         batch_id: Uuid,
@@ -192,7 +194,40 @@ impl DatabaseWriter {
     where
         P: FnOnce() -> Result<PreparedBatch> + Send,
     {
-        self.run(batch_id, queue, prepare).await
+        self.write_prepared_with_recovery_observer(batch_id, queue, prepare, |report, _| {
+            tracing::warn!(
+                queue,
+                %batch_id,
+                nul_characters = report.nul_characters,
+                escaped_keys = report.escaped_keys,
+                affected_values = report.affected_values,
+                locations = ?report.locations,
+                "removing NUL from JSONB values and escaping keys after PostgreSQL 22P05; retrying batch"
+            );
+        })
+        .await
+    }
+
+    /// Uses automatic NUL recovery with a custom diagnostic callback instead of the default warning.
+    /// The callback receives bounded field paths and repaired rows before the single retry.
+    pub async fn write_prepared_with_recovery_observer<P, F>(
+        &self,
+        batch_id: Uuid,
+        queue: &'static str,
+        prepare: P,
+        on_repair: F,
+    ) -> Result<u64>
+    where
+        P: FnOnce() -> Result<PreparedBatch> + Send,
+        F: FnOnce(&JsonNulRepair, &Value) + Send,
+    {
+        self.run(batch_id, queue, || {
+            Ok(NulRecoveringBatch {
+                batch: prepare()?,
+                on_repair,
+            })
+        })
+        .await
     }
 
     pub async fn write_transaction<B: TransactionBatch>(
@@ -334,9 +369,9 @@ trait Operation: Send {
     ) -> impl Future<Output = Result<u64>> + Send;
 }
 
-impl Operation for PreparedBatch {
-    async fn run(
-        self,
+impl PreparedBatch {
+    async fn execute_with_receipt(
+        &self,
         connection: &mut PgConnection,
         id: Uuid,
         queue: &'static str,
@@ -359,6 +394,41 @@ impl Operation for PreparedBatch {
                 .await?
                 .rows_affected())
         }
+    }
+}
+
+struct NulRecoveringBatch<F> {
+    batch: PreparedBatch,
+    on_repair: F,
+}
+
+impl<F: FnOnce(&JsonNulRepair, &Value) + Send> Operation for NulRecoveringBatch<F> {
+    async fn run(
+        mut self,
+        connection: &mut PgConnection,
+        id: Uuid,
+        queue: &'static str,
+    ) -> Result<u64> {
+        let error = match self.batch.execute_with_receipt(connection, id, queue).await {
+            Ok(rows) => return Ok(rows),
+            Err(error) => error,
+        };
+        let is_unicode_error = error.chain().any(|cause| {
+            matches!(cause.downcast_ref::<sqlx::Error>(), Some(sqlx::Error::Database(db))
+                if db.code().as_deref() == Some("22P05"))
+        });
+        if !is_unicode_error {
+            return Err(error);
+        }
+        let report = remove_nuls(&mut self.batch.rows);
+        if report.nul_characters == 0 {
+            return Err(error.context("JSONB Unicode error without recoverable NUL characters"));
+        }
+        (self.on_repair)(&report, &self.batch.rows);
+        self.batch
+            .execute_with_receipt(connection, id, queue)
+            .await
+            .context("write failed after one JSONB NUL recovery attempt")
     }
 }
 

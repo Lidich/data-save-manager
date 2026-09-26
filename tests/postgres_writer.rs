@@ -1030,3 +1030,195 @@ async fn invalid_timezone_fails_readiness_without_writes() -> Result<()> {
     drop(writer);
     fixture.close().await
 }
+
+#[tokio::test]
+#[ignore = "requires local PostgreSQL"]
+async fn nul_recovery_is_automatic_atomic_and_replay_safe() -> Result<()> {
+    let fixture = Fixture::new(true).await?;
+    sqlx::query("CREATE TABLE texts (value text NOT NULL)")
+        .execute(&fixture.pool)
+        .await?;
+    let insert = "INSERT INTO texts SELECT value FROM jsonb_to_recordset((SELECT payload FROM data_save_input)) AS r(value text)";
+    let writer = fixture.writer(timeouts());
+    for counted in [false, true] {
+        let id = Uuid::new_v4();
+        let rows = json!([{"value":"healthy Б🚀"}, {"value":"bad\u{0000}value"}, {"value":"literal \\u0000"}]);
+        let sql = if counted {
+            format!(", saved AS ({insert} RETURNING 1) SELECT count(*) FROM saved")
+        } else {
+            insert.into()
+        };
+        for expected in [3, 0] {
+            assert_eq!(
+                writer
+                    .write_prepared(id, QUEUE, || Ok(if counted {
+                        PreparedBatch::with_count_sql(&sql, rows.clone())
+                    } else {
+                        PreparedBatch::new(&sql, rows.clone())
+                    }))
+                    .await?,
+                expected
+            );
+        }
+        assert_eq!(fixture.receipt_count(id).await?, 1);
+        assert_eq!(rows[1]["value"], "bad\u{0000}value");
+    }
+    let values: Vec<String> = sqlx::query_scalar("SELECT value FROM texts ORDER BY value")
+        .fetch_all(&fixture.pool)
+        .await?;
+    assert_eq!(
+        values,
+        vec![
+            "badvalue",
+            "badvalue",
+            "healthy Б🚀",
+            "healthy Б🚀",
+            "literal \\u0000",
+            "literal \\u0000"
+        ]
+    );
+    drop(writer);
+    fixture.close().await
+}
+
+#[tokio::test]
+#[ignore = "requires local PostgreSQL"]
+async fn nul_recovery_observer_runs_only_for_repair_and_retry_is_bounded() -> Result<()> {
+    let fixture = Fixture::new(true).await?;
+    sqlx::raw_sql("CREATE SEQUENCE attempts; CREATE FUNCTION reject_write() RETURNS trigger AS $$ BEGIN PERFORM nextval('attempts'); RAISE EXCEPTION 'fixture rejection' USING ERRCODE = '22P05'; END $$ LANGUAGE plpgsql; CREATE TRIGGER reject_write BEFORE INSERT ON records FOR EACH ROW EXECUTE FUNCTION reject_write()")
+        .execute(&fixture.pool).await?;
+    let writer = fixture.writer(timeouts());
+    let calls = AtomicUsize::new(0);
+    for (extra, expected_calls) in [("clean", 0), ("bad\0value", 1)] {
+        let id = Uuid::new_v4();
+        let error = writer
+            .write_prepared_with_recovery_observer(
+                id,
+                QUEUE,
+                || Ok(prepared(json!([{"value":7, "extra":extra}]))),
+                |report, rows| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(report.nul_characters, 1);
+                    assert_eq!(report.locations, ["/0/extra"]);
+                    assert_eq!(rows[0]["extra"], "badvalue");
+                },
+            )
+            .await
+            .unwrap_err();
+        failure(&error, id, "database_error", Some("22P05"));
+        assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
+        assert_eq!(fixture.receipt_count(id).await?, 0);
+    }
+    let attempts: i64 = sqlx::query_scalar("SELECT last_value FROM attempts")
+        .fetch_one(&fixture.pool)
+        .await?;
+    assert_eq!(attempts, 2);
+    assert_eq!(fixture.counts().await?, (0, 0));
+    sqlx::query("DROP TRIGGER reject_write ON records")
+        .execute(&fixture.pool)
+        .await?;
+    writer
+        .write_prepared_with_recovery_observer(
+            Uuid::new_v4(),
+            QUEUE,
+            || Ok(prepared(json!([{"value":7}]))),
+            |_, _| panic!("healthy write must not invoke recovery"),
+        )
+        .await?;
+    drop(writer);
+    fixture.close().await
+}
+
+#[tokio::test]
+#[ignore = "requires local PostgreSQL"]
+async fn nul_recovery_preserves_other_errors() -> Result<()> {
+    let fixture = Fixture::new(true).await?;
+    let writer = fixture.writer(timeouts());
+    for (rows, state) in [
+        (json!([{"value":null}]), "23502"),
+        (json!([{"value":"not a number"}]), "22P02"),
+    ] {
+        let id = Uuid::new_v4();
+        let error = writer
+            .write_prepared_with_recovery_observer(
+                id,
+                QUEUE,
+                || Ok(prepared(rows)),
+                |_, _| panic!("unrepairable failure must not invoke observer"),
+            )
+            .await
+            .unwrap_err();
+        failure(&error, id, "database_error", Some(state));
+        assert_eq!(fixture.receipt_count(id).await?, 0);
+    }
+    let id = Uuid::new_v4();
+    let calls = AtomicUsize::new(0);
+    let error = writer
+        .write_prepared_with_recovery_observer(
+            id,
+            QUEUE,
+            || Ok(prepared(json!([{"value":1}, {"value":null,"extra":"\0"}]))),
+            |_, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await
+        .unwrap_err();
+    failure(&error, id, "database_error", Some("23502"));
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.receipt_count(id).await?, 0);
+    assert_eq!(fixture.counts().await?, (0, 0));
+    assert_eq!(
+        writer
+            .write_prepared(id, QUEUE, || Ok(prepared(json!([{"value":1}]))))
+            .await?,
+        1
+    );
+    drop(writer);
+    fixture.close().await
+}
+
+#[tokio::test]
+#[ignore = "requires local PostgreSQL"]
+async fn nul_recovery_repairs_json_keys_without_losing_fields() -> Result<()> {
+    let fixture = Fixture::new(true).await?;
+    sqlx::query("CREATE TABLE documents (metadata jsonb NOT NULL)")
+        .execute(&fixture.pool)
+        .await?;
+    let writer = fixture.writer(timeouts());
+    let sql = "INSERT INTO documents SELECT metadata FROM jsonb_to_recordset((SELECT payload FROM data_save_input)) AS r(metadata jsonb)";
+    for text in ["clean", "bad\0value"] {
+        let rows = json!([{"metadata":{"x\0":1,"x":2,"x\\u0000":3,"x\\\\u0000":4,"nested":[{"\0":text}]}}]);
+        let id = Uuid::new_v4();
+        for expected in [1, 0] {
+            assert_eq!(
+                writer
+                    .write_prepared(id, QUEUE, || Ok(PreparedBatch::new(sql, rows.clone())))
+                    .await?,
+                expected
+            );
+        }
+        assert_eq!(fixture.receipt_count(id).await?, 1);
+        assert_eq!(rows[0]["metadata"]["nested"][0]["\0"], text);
+    }
+    let mut documents: Vec<Value> = sqlx::query_scalar("SELECT metadata FROM documents")
+        .fetch_all(&fixture.pool)
+        .await?;
+    assert_eq!(documents.len(), 2);
+    documents.sort_by_key(|document| {
+        document["nested"][0]["\\u0000"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    });
+    for (document, text) in documents.iter().zip(["badvalue", "clean"]) {
+        assert_eq!(document.as_object().unwrap().len(), 5);
+        assert_eq!(document["x\\u0000"], 1);
+        assert_eq!(document["x"], 2);
+        assert_eq!(document["x\\\\u0000"], 3);
+        assert_eq!(document["x\\\\\\\\u0000"], 4);
+        assert_eq!(document["nested"][0]["\\u0000"], text);
+    }
+    drop(writer);
+    fixture.close().await
+}
