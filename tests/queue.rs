@@ -103,8 +103,7 @@ async fn failures_retain_payload_age_fifo_and_depth_without_splitting() {
         assert_eq!(total.load(Ordering::Relaxed), 501);
         assert_eq!(events.failures.last().unwrap().0.attempt, attempt);
         assert_eq!(queue.flush(&writer, &mut events).await, FlushOutcome::Idle);
-        let delay = (1u64 << (attempt - 1)).min(30);
-        tokio::time::advance(Duration::from_millis(delay * 1000 - 1)).await;
+        tokio::time::advance(Duration::from_millis(999)).await;
         assert_eq!(queue.flush(&writer, &mut events).await, FlushOutcome::Idle);
         tokio::time::advance(Duration::from_millis(1)).await;
     }
@@ -142,16 +141,16 @@ async fn failed_queue_does_not_prevent_another_queue_progress() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn retry_backoff_is_capped_and_resets_for_next_batch() {
+async fn repeated_failures_keep_original_one_second_retry_interval() {
     let (mut queue, depth, _) = queue(501);
     let writer = Recorder {
         failures: AtomicUsize::new(8),
         ..Default::default()
     };
-    for delay in [1, 2, 4, 8, 16, 30, 30, 30] {
+    for _ in 0..8 {
         assert_eq!(queue.flush(&writer, &mut ()).await, FlushOutcome::Retained);
         assert_eq!(depth.load(Ordering::Relaxed), 501);
-        tokio::time::advance(Duration::from_secs(delay)).await;
+        tokio::time::advance(Duration::from_secs(1)).await;
     }
     assert_eq!(queue.flush(&writer, &mut ()).await, FlushOutcome::Success);
     writer.failures.store(1, Ordering::Relaxed);

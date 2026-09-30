@@ -40,10 +40,12 @@ where
 
 /// A single statement whose mutations consume data_save_input.payload; an empty input must write nothing.
 /// Count statements must return zero on replay. Parameters $1, $2 and $3 belong to the writer.
+#[derive(Clone)]
 pub struct PreparedBatch {
     pub sql: String,
     pub rows: Value,
     pub select_count: bool,
+    text_recovery: Option<(String, Vec<String>)>,
 }
 
 impl PreparedBatch {
@@ -52,6 +54,7 @@ impl PreparedBatch {
             sql: sql.into(),
             rows,
             select_count: false,
+            text_recovery: None,
         }
     }
 
@@ -60,11 +63,38 @@ impl PreparedBatch {
             sql: sql.into(),
             rows,
             select_count: true,
+            text_recovery: None,
         }
+    }
+
+    /// Allows length repair for declared descriptive fields only; never declare identifiers or keys.
+    pub fn with_text_recovery(mut self, table: &str, columns: &[&str]) -> Self {
+        self.text_recovery = Some((
+            table.into(),
+            columns.iter().map(|column| (*column).into()).collect(),
+        ));
+        self
     }
 
     /// Executes directly without receipts or writer deadlines, for explicit repository calls.
     pub async fn execute(&self, pool: &PgPool) -> Result<u64> {
+        let mut connection = pool.acquire().await?;
+        match self.execute_direct(&mut connection).await {
+            Err(error) if has_sqlstate(&error, "22001") => {
+                let mut repaired = self.clone();
+                if !repaired.repair_text_limits(&mut connection).await? {
+                    return Err(error);
+                }
+                repaired
+                    .execute_direct(&mut connection)
+                    .await
+                    .context("write failed after one text length recovery attempt")
+            }
+            result => result,
+        }
+    }
+
+    async fn execute_direct(&self, connection: &mut PgConnection) -> Result<u64> {
         let sql = format!(
             "WITH data_save_input AS (SELECT $1::jsonb AS payload) {}",
             self.sql
@@ -72,16 +102,65 @@ impl PreparedBatch {
         if self.select_count {
             let count: i64 = sqlx::query_scalar(&sql)
                 .bind(MeasuredJson(&self.rows))
-                .fetch_one(pool)
+                .fetch_one(connection)
                 .await?;
             return Ok(u64::try_from(count)?);
         }
         Ok(sqlx::query(&sql)
             .bind(MeasuredJson(&self.rows))
-            .execute(pool)
+            .execute(connection)
             .await?
             .rows_affected())
     }
+
+    /// Queries declared field limits only after 22001 and reports lengths without payload contents.
+    async fn repair_text_limits(&mut self, connection: &mut PgConnection) -> Result<bool> {
+        let Some((table, columns)) = self.text_recovery.as_ref() else {
+            return Ok(false);
+        };
+        let limits: Vec<(String, i32)> = sqlx::query_as(
+            "SELECT attname::text, atttypmod - 4 FROM pg_attribute \
+             WHERE attrelid = to_regclass($1) AND attnum > 0 AND NOT attisdropped \
+             AND attname::text = ANY($2) \
+             AND atttypid IN ('varchar'::regtype, 'bpchar'::regtype) AND atttypmod >= 4",
+        )
+        .bind(table)
+        .bind(columns)
+        .fetch_all(connection)
+        .await?;
+        let Some(rows) = self.rows.as_array_mut() else {
+            return Ok(false);
+        };
+        let mut changed = false;
+        for (column, limit) in limits {
+            let limit = usize::try_from(limit)?;
+            let mut affected_rows = 0usize;
+            let mut max_original_chars = 0usize;
+            for row in &mut *rows {
+                let Some(Value::String(value)) = row.get_mut(&column) else {
+                    continue;
+                };
+                if let Some((offset, _)) = value.char_indices().nth(limit) {
+                    max_original_chars = max_original_chars.max(value.chars().count());
+                    value.truncate(offset);
+                    affected_rows += 1;
+                }
+            }
+            if affected_rows > 0 {
+                changed = true;
+                tracing::warn!(table, column, affected_rows, max_original_chars, limit,
+                    sqlstate = "22001", "abnormal text length exceeded database limit; truncating descriptive field before retry");
+            }
+        }
+        Ok(changed)
+    }
+}
+
+fn has_sqlstate(error: &anyhow::Error, state: &str) -> bool {
+    error.chain().any(|cause| {
+        matches!(cause.downcast_ref::<sqlx::Error>(), Some(sqlx::Error::Database(db))
+            if db.code().as_deref() == Some(state))
+    })
 }
 
 /// Runs domain statements on the library-owned transaction without beginning or committing it.
@@ -410,26 +489,35 @@ impl<F: FnOnce(&JsonNulRepair, &Value) + Send> Operation for NulRecoveringBatch<
         id: Uuid,
         queue: &'static str,
     ) -> Result<u64> {
-        let error = match self.batch.execute_with_receipt(connection, id, queue).await {
-            Ok(rows) => return Ok(rows),
-            Err(error) => error,
-        };
-        let is_unicode_error = error.chain().any(|cause| {
-            matches!(cause.downcast_ref::<sqlx::Error>(), Some(sqlx::Error::Database(db))
-                if db.code().as_deref() == Some("22P05"))
-        });
-        if !is_unicode_error {
-            return Err(error);
+        let mut on_repair = Some(self.on_repair);
+        let mut text_repaired = false;
+        loop {
+            let error = match self.batch.execute_with_receipt(connection, id, queue).await {
+                Ok(rows) => return Ok(rows),
+                Err(error) => error,
+            };
+            if has_sqlstate(&error, "22001") && !text_repaired {
+                text_repaired = true;
+                if self.batch.repair_text_limits(connection).await? {
+                    continue;
+                }
+            }
+            if has_sqlstate(&error, "22P05") {
+                if let Some(on_repair) = on_repair.take() {
+                    let report = remove_nuls(&mut self.batch.rows);
+                    if report.nul_characters == 0 {
+                        return Err(
+                            error.context("JSONB Unicode error without recoverable NUL characters")
+                        );
+                    }
+                    on_repair(&report, &self.batch.rows);
+                    continue;
+                }
+            }
+            return Err(
+                error.context("write failed; automatic data recovery unavailable or exhausted")
+            );
         }
-        let report = remove_nuls(&mut self.batch.rows);
-        if report.nul_characters == 0 {
-            return Err(error.context("JSONB Unicode error without recoverable NUL characters"));
-        }
-        (self.on_repair)(&report, &self.batch.rows);
-        self.batch
-            .execute_with_receipt(connection, id, queue)
-            .await
-            .context("write failed after one JSONB NUL recovery attempt")
     }
 }
 

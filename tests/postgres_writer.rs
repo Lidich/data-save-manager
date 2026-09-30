@@ -176,6 +176,154 @@ fn failure(error: &anyhow::Error, id: Uuid, kind: &str, sqlstate: Option<&str>) 
     assert_eq!(failure.sqlstate.as_deref(), sqlstate, "{error:#}");
 }
 
+#[tokio::test]
+#[ignore = "requires local PostgreSQL"]
+async fn text_recovery_uses_column_limits_preserves_unicode_and_receipts() -> Result<()> {
+    let fx = Fixture::new(true).await?;
+    sqlx::query("CREATE TABLE labels (address varchar(8) PRIMARY KEY, title varchar(3), symbol varchar(2), extra jsonb, note text)")
+        .execute(&fx.pool).await?;
+    let rows = json!([
+        {"address":"addr1", "title":"\u{1f680}abcd", "symbol":"long", "extra":{"title":"untouched"}, "note":"untouched"},
+        {"address":"addr2", "title":"abc", "symbol":null, "note":"\u{1f680}"},
+        {"address":"addr3", "title":"", "symbol":"ok"}
+    ]);
+    let sql = "INSERT INTO labels SELECT * FROM jsonb_populate_recordset(NULL::labels, (SELECT payload FROM data_save_input))";
+    let prepare =
+        || {
+            Ok(PreparedBatch::new(sql, rows.clone())
+                .with_text_recovery("labels", &["title", "symbol"]))
+        };
+    let writer = fx.writer(timeouts());
+    let id = Uuid::new_v4();
+    assert_eq!(writer.write_prepared(id, QUEUE, prepare).await?, 3);
+    assert_eq!(writer.write_prepared(id, QUEUE, prepare).await?, 0);
+    assert_eq!(fx.receipt_count(id).await?, 1);
+    let stored: Vec<Value> =
+        sqlx::query_scalar("SELECT to_jsonb(labels) FROM labels ORDER BY address")
+            .fetch_all(&fx.pool)
+            .await?;
+    assert_eq!(stored[0]["title"], "\u{1f680}ab");
+    assert_eq!(stored[0]["symbol"], "lo");
+    assert_eq!(stored[0]["address"], "addr1");
+    assert_eq!(stored[0]["extra"], rows[0]["extra"]);
+    assert_eq!(stored[0]["note"], rows[0]["note"]);
+    assert_eq!(stored[1]["title"], "abc");
+    assert!(stored[1]["symbol"].is_null());
+    assert_eq!(stored[2]["title"], "");
+    assert_eq!(rows[0]["title"], "\u{1f680}abcd");
+    fx.close().await
+}
+
+#[tokio::test]
+#[ignore = "requires local PostgreSQL"]
+async fn text_recovery_keeps_invalid_identifiers_and_other_errors_unacknowledged() -> Result<()> {
+    let fx = Fixture::new(true).await?;
+    sqlx::query(
+        "CREATE TABLE labels (address varchar(3), title varchar(3), value integer NOT NULL)",
+    )
+    .execute(&fx.pool)
+    .await?;
+    let sql = "INSERT INTO labels SELECT * FROM jsonb_populate_recordset(NULL::labels, (SELECT payload FROM data_save_input))";
+    let writer = fx.writer(timeouts());
+    for (rows, state) in [
+        (
+            json!([{"address":"identifier", "title":"longtitle", "value":1}]),
+            "22001",
+        ),
+        (
+            json!([{"address":"ok", "title":"longtitle", "value":null}]),
+            "23502",
+        ),
+    ] {
+        let id = Uuid::new_v4();
+        let error = writer
+            .write_prepared(id, QUEUE, || {
+                Ok(PreparedBatch::new(sql, rows).with_text_recovery("labels", &["title"]))
+            })
+            .await
+            .unwrap_err();
+        failure(
+            &error,
+            id,
+            if state == "22001" {
+                "data_error"
+            } else {
+                "database_error"
+            },
+            Some(state),
+        );
+        assert_eq!(fx.receipt_count(id).await?, 0);
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM labels")
+            .fetch_one(&fx.pool)
+            .await?,
+        0
+    );
+    fx.close().await
+}
+
+#[tokio::test]
+#[ignore = "requires local PostgreSQL"]
+async fn text_recovery_direct_execution_and_nul_recovery_can_coexist() -> Result<()> {
+    let fx = Fixture::new(true).await?;
+    sqlx::query("CREATE TABLE labels (title varchar(3))")
+        .execute(&fx.pool)
+        .await?;
+    let sql = "INSERT INTO labels SELECT * FROM jsonb_populate_recordset(NULL::labels, (SELECT payload FROM data_save_input))";
+    PreparedBatch::new(sql, json!([{"title":"abcdef"}]))
+        .with_text_recovery("labels", &["title"])
+        .execute(&fx.pool)
+        .await?;
+    let writer = fx.writer(timeouts());
+    writer
+        .write_prepared(Uuid::new_v4(), QUEUE, || {
+            Ok(PreparedBatch::new(sql, json!([{"title":"\u{0000}defghi"}]))
+                .with_text_recovery("labels", &["title"]))
+        })
+        .await?;
+    let values: Vec<String> = sqlx::query_scalar("SELECT title FROM labels ORDER BY title")
+        .fetch_all(&fx.pool)
+        .await?;
+    assert_eq!(values, ["abc", "def"]);
+    fx.close().await
+}
+
+#[tokio::test]
+#[ignore = "requires local PostgreSQL"]
+async fn text_recovery_is_error_only_and_retries_at_most_once() -> Result<()> {
+    let fx = Fixture::new(true).await?;
+    let writer = fx.writer(timeouts());
+    assert_eq!(
+        writer
+            .write_prepared(Uuid::new_v4(), QUEUE, || Ok(
+                prepared(json!([{"value":1}])).with_text_recovery("invalid:::table", &["value"])
+            ))
+            .await?,
+        1
+    );
+    sqlx::raw_sql("CREATE TABLE labels (title varchar(3)); CREATE SEQUENCE length_attempts; CREATE FUNCTION reject_length() RETURNS trigger AS $$ BEGIN PERFORM nextval('length_attempts'); RAISE EXCEPTION 'fixture length rejection' USING ERRCODE = '22001'; END $$ LANGUAGE plpgsql; CREATE TRIGGER reject_length BEFORE INSERT ON labels FOR EACH ROW EXECUTE FUNCTION reject_length()")
+        .execute(&fx.pool).await?;
+    let sql = "INSERT INTO labels SELECT title::text FROM jsonb_to_recordset((SELECT payload FROM data_save_input)) AS r(title text)";
+    let id = Uuid::new_v4();
+    let error = writer
+        .write_prepared(id, QUEUE, || {
+            Ok(PreparedBatch::new(sql, json!([{"title":"abcdef"}]))
+                .with_text_recovery("labels", &["title"]))
+        })
+        .await
+        .unwrap_err();
+    failure(&error, id, "data_error", Some("22001"));
+    assert_eq!(fx.receipt_count(id).await?, 0);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT last_value FROM length_attempts")
+            .fetch_one(&fx.pool)
+            .await?,
+        1
+    );
+    fx.close().await
+}
+
 enum Pause {
     None,
     Rust,
