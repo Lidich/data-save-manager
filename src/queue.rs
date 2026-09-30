@@ -9,7 +9,15 @@ use crate::QueueTelemetry;
 
 const MAX_BATCH_SIZE: usize = 500;
 const RETRY_DELAY: Duration = Duration::from_secs(1);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 const ALERT_AFTER_FAILURES: u32 = 5;
+
+/// Bounds repeated failed writes without changing the retained batch or blocking other queues.
+fn retry_delay(failures: u32) -> Duration {
+    RETRY_DELAY
+        .saturating_mul(1u32 << failures.saturating_sub(1).min(5))
+        .min(MAX_RETRY_DELAY)
+}
 
 pub struct Queued<T> {
     pub value: T,
@@ -208,7 +216,7 @@ impl<T, Id: BatchIdentity> BatchQueue<T, Id> {
                 batch.failures = batch.failures.saturating_add(1);
                 let alert = !batch.alerted && batch.failures >= ALERT_AFTER_FAILURES;
                 batch.alerted |= alert;
-                self.retry_after = Some(tokio::time::Instant::now() + RETRY_DELAY);
+                self.retry_after = Some(tokio::time::Instant::now() + retry_delay(batch.failures));
                 info.pending = self.depth.load(Ordering::Relaxed);
                 observer.failure(info, &error, started.elapsed(), alert);
                 FlushOutcome::Retained

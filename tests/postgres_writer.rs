@@ -127,6 +127,45 @@ fn prepared(rows: Value) -> PreparedBatch {
     PreparedBatch::new(INSERT_SQL, rows)
 }
 
+#[tokio::test]
+#[ignore = "requires local PostgreSQL"]
+async fn oversized_text_retains_receipt_identity_and_recovers_after_schema_fix() -> Result<()> {
+    let fx = Fixture::new(true).await?;
+    sqlx::query("CREATE TABLE labels (name varchar(255))")
+        .execute(&fx.pool)
+        .await?;
+    let writer = fx.writer(timeouts());
+    let id = Uuid::new_v4();
+    let name = "x".repeat(1024);
+    let prepare = || {
+        Ok(PreparedBatch::new(
+        "INSERT INTO labels SELECT name FROM jsonb_populate_recordset(NULL::labels, (SELECT payload FROM data_save_input))",
+        json!([{ "name": name }, { "name": "normal" }]),
+    ))
+    };
+    let error = writer.write_prepared(id, QUEUE, prepare).await.unwrap_err();
+    failure(&error, id, "data_error", Some("22001"));
+    assert_eq!(fx.receipt_count(id).await?, 0);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM labels")
+            .fetch_one(&fx.pool)
+            .await?,
+        0
+    );
+    sqlx::query("ALTER TABLE labels ALTER COLUMN name TYPE text")
+        .execute(&fx.pool)
+        .await?;
+    assert_eq!(writer.write_prepared(id, QUEUE, prepare).await?, 2);
+    assert_eq!(writer.write_prepared(id, QUEUE, prepare).await?, 0);
+    assert_eq!(fx.receipt_count(id).await?, 1);
+    let names: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM labels ORDER BY length(name) DESC")
+            .fetch_all(&fx.pool)
+            .await?;
+    assert_eq!(names, [name, "normal".into()]);
+    fx.close().await
+}
+
 fn failure(error: &anyhow::Error, id: Uuid, kind: &str, sqlstate: Option<&str>) {
     let failure = error
         .downcast_ref::<WriteFailure>()
@@ -1105,7 +1144,7 @@ async fn nul_recovery_observer_runs_only_for_repair_and_retry_is_bounded() -> Re
             )
             .await
             .unwrap_err();
-        failure(&error, id, "database_error", Some("22P05"));
+        failure(&error, id, "data_error", Some("22P05"));
         assert_eq!(calls.load(Ordering::SeqCst), expected_calls);
         assert_eq!(fixture.receipt_count(id).await?, 0);
     }
@@ -1148,7 +1187,12 @@ async fn nul_recovery_preserves_other_errors() -> Result<()> {
             )
             .await
             .unwrap_err();
-        failure(&error, id, "database_error", Some(state));
+        let kind = if state.starts_with("22") {
+            "data_error"
+        } else {
+            "database_error"
+        };
+        failure(&error, id, kind, Some(state));
         assert_eq!(fixture.receipt_count(id).await?, 0);
     }
     let id = Uuid::new_v4();

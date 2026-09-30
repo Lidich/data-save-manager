@@ -298,6 +298,7 @@ impl DatabaseWriter {
             match sqlstate.as_deref() {
                 Some("55P03") => "lock_timeout",
                 Some("57014") => "statement_cancelled",
+                Some(code) if code.starts_with("22") => "data_error",
                 Some(_) => "database_error",
                 None if stage == "acquire" => "acquire_error",
                 None if stage == "prepare" => "serialization_error",
